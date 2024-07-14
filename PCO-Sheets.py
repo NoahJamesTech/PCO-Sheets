@@ -11,7 +11,6 @@ import sys
 import time
 import schedule
 
-increment = 25
 lastFound = 50
 response = None
 data = None
@@ -33,12 +32,29 @@ def queryPCO(service_type_id,offset,increment,application_id,secret, debug):
     data = response.read().decode()
     conn.close()
 
-def get_plan_id_by_date(service_type_id, date, application_id, secret, debug):
+def get_plan_id_by_date(service_type_id, date, application_id, secret, findingService, debug):
     
-    global lastFound, increment, response, data
-    offset = lastFound
+    global lastFound, response, data
 
-    while True:
+    if findingService:
+        if data == "PewPewPew":
+            mathNumber = 1000
+            increment = 25
+            offset = lastFound
+            findingService = False
+            queryPCO(service_type_id,offset,increment,application_id,secret, debug)
+            print(f"Initial service found")
+        else:
+            mathNumber = 1000
+            offset = 0
+            increment = 100
+            print(f"Searching for starting position (patience)")
+    else:
+        mathNumber = 49
+        offset = lastFound
+        increment = 25
+
+    while 3==1+2: #crazy math i know
         if response.status == 200:
             plans = json.loads(data)
             for plan in plans['data']:
@@ -47,6 +63,11 @@ def get_plan_id_by_date(service_type_id, date, application_id, secret, debug):
                     if debug:
                         print(f"#Debug: Found Service on {date}")
                     lastFound = offset
+                    if findingService:
+                        if debug:
+                            print(f"#Debug: Found ballpark, scanning narrowly")
+                        data = "PewPewPew"
+                        get_plan_id_by_date(service_type_id, date, application_id, secret, True, debug)
                     return plan['id']
             offset+=increment
             if debug:
@@ -56,7 +77,7 @@ def get_plan_id_by_date(service_type_id, date, application_id, secret, debug):
             print(f"#Error: Failed to retrieve plans: {response.status}")
             return None
 
-        if offset > lastFound + 49:
+        if offset > lastFound + mathNumber:
             queryPCO(service_type_id,lastFound,increment,application_id,secret, debug)
             raise NotFoundErr(f"No plan found for {date}")
 
@@ -78,7 +99,6 @@ def get_item_id_by_plan(service_type_id, plan_id, application_id, secret, debug)
 
     if response.status == 200:
         items = json.loads(data)
-
         # Filter items by title and get the id
         for item in items['data']:
             if item['attributes']['title'] == 'Scripture Readings' or item['attributes']['title'] == 'Scripture Reading' or item['attributes']['title'] == 'Scripture':
@@ -98,10 +118,8 @@ def get_item_id_by_plan(service_type_id, plan_id, application_id, secret, debug)
     
 
 
-
-def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTURE_READING, debug):
-    print(f"Updating service on {datetime_to_string(datetime)} with {SCRIPTURE_READING}")
-    PLAN_ID = get_plan_id_by_date(service_type_id, datetime_to_string(datetime), application_id, secret, debug)
+def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTURE_READING, findingService, debug):
+    PLAN_ID = get_plan_id_by_date(service_type_id, datetime_to_string(datetime), application_id, secret, findingService, debug)
     if not PLAN_ID:
         sys.exit(1)
 
@@ -136,6 +154,7 @@ def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTU
     data = response.read().decode()
 
     if response.status == 200:
+        print(f"Updated service on {datetime_to_string(datetime)} with {SCRIPTURE_READING}")
         if debug:
             print(f"#Debug: Successfully pushed \"{SCRIPTURE_READING}\" to Scripture Readings section of plan on {datetime_to_string(datetime)}")
     else:
@@ -144,11 +163,10 @@ def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTU
 
     conn.close()
 
-
 def datetime_to_string(dt):
     return dt.strftime("%B %d, %Y").replace(" 0", " ").lstrip("0")
 
-def PCOSheetsRunSynchronization(debug):
+def PCOSheetsRunSynchronization(debug, startYear):
 
     service_account_file = 'creds.json'
     scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
@@ -173,11 +191,13 @@ def PCOSheetsRunSynchronization(debug):
     if not all([application_id, secret, service_type_id]):
         print("Planning Center credentials are missing in the JSON file.")
         return
+    
 
-    queryPCO(service_type_id,lastFound,increment,application_id,secret, debug)
+    queryPCO(service_type_id,lastFound,25,application_id,secret, debug)
 
+    findingService = True
 
-    for i in range(2015, datetime.now().year + 1):
+    for i in range(startYear, datetime.now().year + 1):
         range_string = f"{i}!A2:C60"
         try:
             result = sheet.values().get(spreadsheetId=spreadsheet_id, range=range_string).execute()
@@ -186,42 +206,62 @@ def PCOSheetsRunSynchronization(debug):
                 print(f'#Error No data found for the year {i}.')
             else:
                 for row_index, row in enumerate(values):
-                    values[row_index] = [f"{cell}/{i}" for cell in row]
-                    currDate = datetime.strptime(values[row_index][0], '%m/%d/%Y')
+                    for col_index, cell in enumerate(row):
+                        if col_index == 0:
+                            values[row_index][col_index] = f"{cell}/{i}"
+                    
+                    currDate = datetime.strptime(values[row_index][0], '%m/%d/%Y') 
                     if values[row_index][1]:
                         values[row_index][1] = "NULL"
                     try:
                         if len(values[row_index]) == 3:
-                            values[row_index][1] = get_plan_id_by_date(service_type_id, datetime_to_string(currDate), application_id, secret, debug)
-                            values[row_index][2] = values[row_index][2][:-5]
-                            push_data_by_date(service_type_id, application_id, secret, currDate, values[row_index][2], debug)
+                            #values[row_index][1] = get_plan_id_by_date(service_type_id, datetime_to_string(currDate), application_id, secret, debug)
+                            if row_index == 0 or findingService:
+                                push_data_by_date(service_type_id, application_id, secret, currDate, values[row_index][2], findingService, debug)
+                                findingService = False
+                            else:
+                                push_data_by_date(service_type_id, application_id, secret, currDate, values[row_index][2], findingService, debug)
                         else:
                             print(f"No scripture provided for {datetime_to_string(currDate)}")
                     except Exception as e:   
-                        print(f'#Error: {e}') 
+                        print(f"#Error: Updating service on {datetime_to_string(currDate)}: {e}") 
         except Exception as e:
             print(f'#Error: An error occurred for the year {i}: {e}')
 
         print(f"Sync Complete at {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+        print_next_run_times()
 
 def parse_arguments():
-    runFirst = False
+    fullRunOnStart = False
     debug = False
+    startYear = 2015
 
     if len(sys.argv) > 1 and sys.argv[1].lower() in ('true', '1', 't', 'y', 'yes'):
-        runFirst = True
+        fullRunOnStart = True
     if len(sys.argv) > 2 and sys.argv[2].lower() in ('true', '1', 't', 'y', 'debug'):
         debug = True
-    
-    return runFirst, debug
+    if len(sys.argv) > 3:
+        startYear = int(sys.argv[3])
+    return startYear, fullRunOnStart, debug
 
-runFirst, debug = parse_arguments()
+def print_next_run_times():
+    for job in schedule.get_jobs():
+        next_run = job.next_run.strftime("%Y-%m-%d %H:%M:%S")
+        if job.interval == 1 and job.unit == 'hours':
+            print(f"Next hourly job will run at: {next_run}")
+        elif job.interval == 1 and job.unit == 'weeks':
+            print(f"Next weekly job will run at: {next_run}")
 
-if(runFirst):
-    PCOSheetsRunSynchronization(debug)
+startYear, fullRunOnStart, debug = parse_arguments()
 
-print(f"Scheduled to Run at 1:00")
-schedule.every().day.at("01:00:00").do(PCOSheetsRunSynchronization, debug)
+if(fullRunOnStart):
+    PCOSheetsRunSynchronization(debug, startYear)
+else:
+    PCOSheetsRunSynchronization(debug,datetime.now().year)
+
+schedule.every().hour.do(PCOSheetsRunSynchronization, debug, datetime.now().year)
+schedule.every().week.do(PCOSheetsRunSynchronization, debug, startYear)
+print_next_run_times()
 
 while True:
     schedule.run_pending()
