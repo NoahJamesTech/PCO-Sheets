@@ -3,6 +3,7 @@ from google.oauth2 import service_account # type: ignore
 from googleapiclient.discovery import build # type: ignore
 import os.path
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import http.client
 import json
 import base64
@@ -11,9 +12,29 @@ import sys
 import time
 import schedule
 import paho.mqtt.client as mqtt
-from paho.mqtt.client import MQTTMessage
+from paho.mqtt.client import MQTTMessage, CallbackAPIVersion
 from ha_mqtt_discoverable import Settings, DeviceInfo
 from ha_mqtt_discoverable.sensors import Sensor, SensorInfo, BinarySensor, BinarySensorInfo, Button, ButtonInfo, Switch, SwitchInfo
+import re
+
+BIBLE_BOOKS_FULL = [
+    "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy",
+    "Joshua", "Judges", "Ruth",
+    "1 Samuel", "2 Samuel", "1 Kings", "2 Kings",
+    "1 Chronicles", "2 Chronicles", "Ezra", "Nehemiah", "Esther",
+    "Job", "Psalms", "Proverbs", "Ecclesiastes", "Song of Solomon",
+    "Isaiah", "Jeremiah", "Lamentations", "Ezekiel", "Daniel",
+    "Hosea", "Joel", "Amos", "Obadiah", "Jonah", "Micah", "Nahum",
+    "Habakkuk", "Zephaniah", "Haggai", "Zechariah", "Malachi",
+    "Matthew", "Mark", "Luke", "John", "Acts",
+    "Romans", "1 Corinthians", "2 Corinthians", "Galatians", "Ephesians",
+    "Philippians", "Colossians", "1 Thessalonians", "2 Thessalonians",
+    "1 Timothy", "2 Timothy", "Titus", "Philemon", "Hebrews",
+    "James", "1 Peter", "2 Peter", "1 John", "2 John", "3 John",
+    "Jude", "Revelation",
+]
+
+TZ = ZoneInfo("America/Chicago")
 
 debug = False
 partial = False
@@ -23,6 +44,40 @@ if os.path.exists("creds.json"):
     with open('creds.json', 'r') as file:
         creds_data = json.load(file)
         mqtt_creds = creds_data.get('mqtt', {})
+
+
+def expand_book_ref(ref: str) -> str:
+    ref = ref.strip()
+    parts = ref.split(' ', 2)
+    if parts[0].isdigit() and len(parts) > 1:
+        abbr_token = f"{parts[0]} {parts[1].rstrip('.,;:')}"
+        rest = parts[2] if len(parts) > 2 else ""
+    else:
+        abbr_token = parts[0].rstrip('.,;:')
+        rest = parts[1] if len(parts) > 1 else ""
+    abbr_low = abbr_token.lower()
+    for full in BIBLE_BOOKS_FULL:
+        if full.lower().startswith(abbr_low):
+            return f"{full} {rest}".strip()
+    return ref
+
+def unabbreviate_Bible_Books(line: str) -> str:
+    tokens = re.split(r'([,;])', line)
+    out = []
+    for tok in tokens:
+        if tok in ",;":
+            out.append(tok)
+        elif tok.strip():
+            out.append(expand_book_ref(tok))
+    result = ""
+    for tok in out:
+        if tok in ",;":
+            result = result.rstrip() + tok
+        else:
+            result += " " + tok
+    return result.strip()
+
+
 
 buttonMQTT = Settings.MQTT(
     host=mqtt_creds.get('broker_ip'),
@@ -62,7 +117,6 @@ def debug_switch_callback(client, user_data, message: MQTTMessage):
         print("Debug Mode Turned Off!")
         debug_mode_switch.off()
 
-
 full_sync_button_info = ButtonInfo(
     name="Full Sync",
     unique_id="full_sync_button",
@@ -101,18 +155,22 @@ debug_mode_switch = Switch(
     debug_switch_callback,
 )
 
-
-full_sync_button.write_config()
-partial_sync_button.write_config()
-
-
-MQTTCLIENT = mqtt.Client(protocol=mqtt.MQTTv311)
+MQTTCLIENT = mqtt.Client(
+    callback_api_version=CallbackAPIVersion.VERSION2,
+    protocol=mqtt.MQTTv311)
 MQTTCLIENT.username_pw_set(mqtt_creds.get('username'), mqtt_creds.get('password'))
 MQTTCLIENT.connect(mqtt_creds.get('broker_ip'), int(mqtt_creds.get('port')), 60)
 MQTTCLIENT.enable_logger()
+MQTTCLIENT.reconnect_delay_set(min_delay=1, max_delay=60)
 mqtt_settings = Settings.MQTT(client=MQTTCLIENT)
 
 device_info = {"name": "PCO Sheets Bridge", "identifiers": "pco_sheets_bridge"}
+
+full_sync_button.write_config()
+partial_sync_button.write_config()
+debug_mode_switch.write_config()
+debug_mode_switch.write_config()
+debug_mode_switch.off()
 
 
 binary_sensors = {
@@ -164,6 +222,18 @@ text_sensors = {
             ),
         )
     ),
+    "currently_updating_service_info": Sensor(
+        Settings(
+            mqtt=mqtt_settings,
+            entity=SensorInfo(
+                name="Currently Updating Service Info",
+                unique_id="currently_updating_service_info",
+                device_class=None,
+                unit_of_measurement=None,
+                device=device_info,
+            ),
+        )
+    ),
     "last_full_sync": Sensor(
         Settings(
             mqtt=mqtt_settings,
@@ -192,6 +262,10 @@ text_sensors = {
     ),
 }
 
+for sensor in binary_sensors.values():
+    sensor.write_config()
+for sensor in text_sensors.values():
+    sensor.write_config()
 
 # Finished Setting up MQTT, move to main
 
@@ -199,6 +273,52 @@ binary_sensors["PCO-Sheets Online"].on()
 lastFound = 50
 response = None
 data = None
+
+
+def createService(service_type_id, dt, application_id, secret):
+    print("Creating service for", datetime_to_string(dt))
+    iso_date = dt.date().isoformat()
+    HOST = 'api.planningcenteronline.com'
+    URL = f'/services/v2/service_types/{service_type_id}/create_plans'
+    
+    payload = {
+        "data": {
+            "type": "create_plans",
+            "attributes": {
+                "count": 1,
+                "copy_items": True,
+                "copy_people": True,
+                "team_ids": None,
+                "copy_notes": True,
+                "as_template": False,
+                "base_date": iso_date
+            },
+            "relationships": {
+                "template": {
+                    "data": [
+                        { "type": "template", "id": str(64994987) }
+                    ]
+                }
+            }
+        }
+    }
+    
+    body = json.dumps(payload)
+    
+    conn = http.client.HTTPSConnection(HOST, context=ssl._create_unverified_context())
+    auth = base64.b64encode(f'{application_id}:{secret}'.encode()).decode()
+    headers = {
+        'Authorization': f'Basic {auth}',
+        'Content-Type': 'application/json'
+    }
+    if debug:
+        print(f"#Debug:  Creating service for {datetime_to_string(dt)}")
+    conn.request('POST', URL, body=body, headers=headers)
+    response = conn.getresponse()
+    data = response.read().decode()
+    conn.close()
+    data_json = json.loads(data) 
+    return data_json["data"][0]["id"] 
 
 def queryPCO(service_type_id,offset,increment,application_id,secret):
     global response, data, debug
@@ -265,7 +385,6 @@ def get_plan_id_by_date(service_type_id, date, application_id, secret, findingSe
             queryPCO(service_type_id,lastFound,increment,application_id,secret)
             raise NotFoundErr(f"No plan found for {date}")
 
-
 def get_item_id_by_plan(service_type_id, plan_id, application_id, secret):
     global debug
     URL = f'/services/v2/service_types/{service_type_id}/plans/{plan_id}/items'
@@ -303,9 +422,19 @@ def get_item_id_by_plan(service_type_id, plan_id, application_id, secret):
     
 
 
-def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTURE_READING, findingService):
+def push_data_by_date(service_type_id, application_id, secret, dt, SCRIPTURE_READING, findingService):
     global debug
-    PLAN_ID = get_plan_id_by_date(service_type_id, datetime_to_string(datetime), application_id, secret, findingService)
+    try:
+        PLAN_ID = get_plan_id_by_date(service_type_id, datetime_to_string(dt), application_id, secret, findingService)
+    except NotFoundErr:
+        if SCRIPTURE_READING.strip():
+            if dt.year < datetime.now().year:
+                print(f"Not creating service for {datetime_to_string(dt)} as it is in the past.")
+                return
+            PLAN_ID = createService(service_type_id, dt, application_id, secret)
+        else:
+            print(f"No scripture for {datetime_to_string(dt)}, not creating service.")
+            return
     if not PLAN_ID:
         sys.exit(1)
 
@@ -314,15 +443,16 @@ def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTU
     URL = f'/services/v2/service_types/{service_type_id}/plans/{PLAN_ID}/items/{ITEM_ID}'
     HOST = 'api.planningcenteronline.com'
 
+    scriptureExpanded = unabbreviate_Bible_Books(SCRIPTURE_READING)
 
-    scriptureString = f"<p>{SCRIPTURE_READING}</p>\n<p><span style=\"font-size:8px;\">Imported by Noah's PCO-Sheets Bridge Utility at {datetime.now().strftime('%Y-%m-%d %I:%M %p')} </p>"
+    scriptureString = f"<p>{scriptureExpanded}</p>\n<p><span style=\"font-size:8px;\">({SCRIPTURE_READING})<br>Imported by Noah's PCO-Sheets Bridge Utility at {rightNow()}</span></p>"
 
     payload = {
         "data": {
             "type": "Item",
             "id": ITEM_ID,
             "attributes": {
-                "description": SCRIPTURE_READING,
+                "description": scriptureExpanded,
                 "html_details": scriptureString
             }
         }
@@ -340,10 +470,11 @@ def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTU
     data = response.read().decode()
 
     if response.status == 200:
-        print(f"Updated service on {datetime_to_string(datetime)} with {SCRIPTURE_READING}")
-        text_sensors["currently_updating_service"].set_state(datetime_to_string(datetime))
+        print(f"Updated service on {datetime_to_string(dt)} with {scriptureExpanded}")
+        text_sensors["currently_updating_service"].set_state(datetime_to_string(dt))
+        text_sensors["currently_updating_service_info"].set_state(scriptureExpanded)
         if debug:
-            print(f"#Debug: Successfully pushed \"{SCRIPTURE_READING}\" to Scripture Readings section of plan on {datetime_to_string(datetime)}")
+            print(f"#Debug: Successfully pushed \"{scriptureExpanded}\" to Scripture Readings section of plan on {datetime_to_string(datetime)}")
     else:
         print(f"#Error: Failed to update 'html_details': {response.status}")
         print(data)
@@ -353,9 +484,12 @@ def push_data_by_date(service_type_id, application_id, secret, datetime, SCRIPTU
 def datetime_to_string(dt):
     return dt.strftime("%B %d, %Y").replace(" 0", " ").lstrip("0")
 
+def rightNow():
+    return datetime.now(TZ).strftime('%Y-%m-%d %I:%M %p')
+
 def PCOSheetsRunSynchronization(startYear):
     global partial, debug
-    MQTTCLIENT.connect(mqtt_creds.get('broker_ip'), int(mqtt_creds.get('port')), 60)
+    #MQTTCLIENT.connect(mqtt_creds.get('broker_ip'), int(mqtt_creds.get('port')), 60)
     service_account_file = 'creds.json'
     scopes = ['https://www.googleapis.com/auth/spreadsheets.readonly']
     spreadsheet_id = '13PLI1UFcaAnyFp1MqTFLhC2Gy8nnvyFMQ5Kst6cTeY0'
@@ -399,8 +533,8 @@ def PCOSheetsRunSynchronization(startYear):
                             values[row_index][col_index] = f"{cell}/{i}"
                     
                     currDate = datetime.strptime(values[row_index][0], '%m/%d/%Y') 
-                    if values[row_index][1]:
-                        values[row_index][1] = "NULL"
+                    #if values[row_index][1]:
+                    #    values[row_index][1] = "NULL"
                     try:
                         if len(values[row_index]) == 3:
                             #values[row_index][1] = get_plan_id_by_date(service_type_id, datetime_to_string(currDate), application_id, secret)
@@ -415,18 +549,19 @@ def PCOSheetsRunSynchronization(startYear):
                         print(f"#Error: Updating service on {datetime_to_string(currDate)}: {e}") 
         except Exception as e:
             print(f'#Error: An error occurred for the year {i}: {e}')
-        binary_sensors["partial_sync_running"].off()
-        binary_sensors["full_sync_running"].off()
-        if partial:
-            text_sensors["last_partial_sync"].set_state(datetime.now().strftime('%Y-%m-%d %I:%M %p'))
-        else:
-            text_sensors["last_full_sync"].set_state(datetime.now().strftime('%Y-%m-%d %I:%M %p'))
 
-        print(f"Sync Complete at {datetime.now().strftime('%Y-%m-%d %I:%M %p')}")
+    binary_sensors["partial_sync_running"].off()
+    binary_sensors["full_sync_running"].off()
+    text_sensors["currently_updating_service"].set_state("Not running")
+    text_sensors["currently_updating_service_info"].set_state("Not running")
+    if partial:
+        text_sensors["last_partial_sync"].set_state(rightNow())
+    else:
+        text_sensors["last_full_sync"].set_state(rightNow())
 
-
+    print(f"Sync Complete at {rightNow()}")
 MQTTCLIENT.loop_start()
-
+print("PCO Sheets Bridge Started -- Waiting for commands")
 try:
     while True:
         time.sleep(1)
@@ -435,5 +570,7 @@ except KeyboardInterrupt:
     binary_sensors["partial_sync_running"].off()
     binary_sensors["full_sync_running"].off()
     binary_sensors["PCO-Sheets Online"].off()
-    time.sleep(1)
+    text_sensors["currently_updating_service"].set_state("Not running")
+    text_sensors["currently_updating_service_info"].set_state("Not running")
+    MQTTCLIENT.disconnect()
     MQTTCLIENT.disconnect()
